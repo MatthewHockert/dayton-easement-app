@@ -1,0 +1,18 @@
+# R
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+
+# renv: keep lockfile + activate script, ignore the local library
+renv/library/
+renv/staging/
+renv/python/
+renv/local/
+renv/cellar/
+
+# Cache files (regenerated, not needed by app)
+*_cache.rds
+
+# OS
+.DS_Store
