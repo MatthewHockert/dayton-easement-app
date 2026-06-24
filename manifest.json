@@ -2461,14 +2461,8 @@
     "data_prep.R": {
       "checksum": "1d99180237feac9a67932c52a0415d4c"
     },
-    "dayton_adjacency_cache.rds": {
-      "checksum": "d75b8c19482144fffdaa60407b9adb01"
-    },
     "dayton_app_data.rds": {
       "checksum": "d3a35adf6d77831857cb36b243ef4461"
-    },
-    "dayton_parcels_cache.rds": {
-      "checksum": "a7fbef578962604a08a6d4870eb4f365"
     },
     "README.md": {
       "checksum": "c574da4d8434225b8b5800fc3d4353e6"
