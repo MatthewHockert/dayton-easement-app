@@ -63,6 +63,24 @@ zone_colors <- c(
 zone_pal <- colorFactor(unname(zone_colors), levels = names(zone_colors),
                         ordered = TRUE, na.color = "#CCCCCC")
 
+# Display labels: show the unit/acre range instead of the broad density word.
+# Internal `display_category` values are kept as logic/color keys; only the
+# user-facing text is relabeled. Ranges are the project's generic densities
+# (city_report.qmd) — confirm against Dayton's zoning ordinance before relying
+# on the exact thresholds.
+density_range_labels <- c(
+  "Residential (Low Density)"    = "Residential (1)",
+  "Residential (Medium Density)" = "Residential (2-6)",
+  "Residential (High Density)"   = "Residential (>6)"
+)
+relabel_density <- function(x) {
+  out <- unname(density_range_labels[as.character(x)])
+  ifelse(is.na(out), as.character(x), out)
+}
+# Carry a display-only label alongside the logic key
+zoning$disp_label <- relabel_density(zoning$display_category)
+geom$disp_label   <- relabel_density(geom$display_category)
+
 # Zonation palette: 0 = no data (grey), 1-7 = yellow → dark green ramp
 zonation_colors <- c(
   "0" = "#EEEEEE",   # no data
@@ -161,9 +179,6 @@ ui <- fluidPage(
           div(class = "value", textOutput("n_sel", inline = TRUE))),
       sliderInput("deduction", "Deduction rate (applies to all selected)",
                   min = 0, max = 100, value = 100, step = 5, post = "%"),
-      hr(),
-      div(style = "font-size:11px; color:#666; text-transform:uppercase; margin-bottom:6px; letter-spacing:0.5px;",
-          "Densification offset"),
       div(class = "metric",
           div(class = "label", "Easement acres"),
           div(class = "value", textOutput("off_ea_acres", inline = TRUE))),
@@ -173,7 +188,8 @@ ui <- fluidPage(
       div(class = "metric",
           div(class = "label", "Lost capacity per acre"),
           div(class = "value", textOutput("off_ea_per_ac", inline = TRUE))),
-      tags$hr(style = "margin:8px 0; border-top:1px dashed #ccc;"),
+      hr(),
+      h4("Densification offset"),
       div(style = "font-size:10px; color:#888; text-transform:uppercase; margin-bottom:4px;",
           "Acres needed to offset"),
       uiOutput("offset_rows"),
@@ -247,7 +263,7 @@ server <- function(input, output, session) {
                   fillOpacity = 0.80, color = "#444", weight = 0.4,
                   group = "Zoning",
                   label = ~paste0(zone_code, " — ", zone_name,
-                                  " (", display_category, ")")) |>
+                                  " (", disp_label, ")")) |>
       addPolygons(data = geom,
                   layerId = ~PID,
                   fillColor = "#ffffff", fillOpacity = 0,
@@ -260,7 +276,7 @@ server <- function(input, output, session) {
                     "<b>PID ", PID, "</b>",
                     ifelse(in_sim, "", " <i>(exempt)</i>"), "<br>",
                     "Zone: ", ifelse(is.na(zone_code), "—",
-                                     paste0(zone_code, " (", display_category, ")")), "<br>",
+                                     paste0(zone_code, " (", disp_label, ")")), "<br>",
                     "Zonation priority: ", priority_score, "/7<br>",
                     "Tax capacity: ",
                     ifelse(in_sim,
@@ -302,8 +318,8 @@ server <- function(input, output, session) {
         options = layersControlOptions(collapsed = FALSE)) |>
       hideGroup("Zonation Priority") |>
       hideGroup("Suggested Development") |>
-      addLegend("bottomleft", pal = zone_pal,
-                values = names(zone_colors), title = "Zoning",
+      addLegend("bottomleft", colors = unname(zone_colors),
+                labels = relabel_density(names(zone_colors)), title = "Zoning",
                 opacity = 0.8, group = "Zoning") |>
       addLegend("bottomleft", pal = zonation_pal,
                 values = names(zonation_colors),
@@ -700,11 +716,10 @@ server <- function(input, output, session) {
   })
 
   off_labels <- c(
-    "Residential (Low Density)"    = "Residential (Low)",
-    "Residential (Medium Density)" = "Residential (Med)",
-    "Residential (High Density)"   = "Residential (High)",
-    "Commercial"                   = "Commercial",
-    "Mixed Use"                    = "Mixed Use"
+    "Residential (Low Density)"    = "Residential (1)",
+    "Residential (Medium Density)" = "Residential (2-6)",
+    "Residential (High Density)"   = "Residential (>6)",
+    "Commercial"                   = "Commercial"
   )
   output$offset_rows <- renderUI({
     sc <- scenario()
@@ -722,10 +737,10 @@ server <- function(input, output, session) {
           div(style = "font-size:12px; color:#333; font-weight:600; margin-bottom:4px;",
               off_labels[cat]),
           tags$ul(style = "margin:0; padding-left:18px; font-size:11px; color:#555; line-height:1.5;",
-            tags$li(tags$b(fmt_ac),
-                    " — acres needed to generate the tax capacity your easements removed"),
             tags$li(tags$b(fmt_pa, "/ac"),
                     " — Dayton's average tax capacity per acre (computed from existing parcels in this zoning)"),
+            tags$li(tags$b(fmt_ac),
+                    " — acres needed to generate the tax capacity your easements removed"),
             tags$li(tags$b("1 ac = ", fmt_r),
                     " — one acre replaces this many acres of your current easement in tax capacity")
           ))
