@@ -2453,16 +2453,25 @@
   },
   "files": {
     ".Rprofile": {
-      "checksum": "acb65683dadb273ed57ca276d955c220"
+      "checksum": "eebbb1ba042cb8abe25fa1c9f3d18702"
     },
     "app.R": {
-      "checksum": "c66a2d8ac14486d70a0f8110ebb0fce1"
+      "checksum": "e059238f4db0019afc2b1b946033dc74"
     },
     "data_prep.R": {
       "checksum": "1d99180237feac9a67932c52a0415d4c"
     },
     "dayton_app_data.rds": {
       "checksum": "d3a35adf6d77831857cb36b243ef4461"
+    },
+    "dayton_parcel_codes.csv": {
+      "checksum": "5b8b0b0a93257dd767a32b65f0533abd"
+    },
+    "dayton_parcel_plats.csv": {
+      "checksum": "38fc1bc79d08ca2a0550c0c4bb1da003"
+    },
+    "offset_benchmarks_peers.csv": {
+      "checksum": "f98eb1ee2b1e0ffb7144d60ecb0ec233"
     },
     "README.md": {
       "checksum": "c574da4d8434225b8b5800fc3d4353e6"

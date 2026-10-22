@@ -1,0 +1,3 @@
+category,geography,parcels,acres,ntc_per_ac,definition,source
+Apartments,"Outer-ring peers: Chanhassen, Corcoran, Dayton, Greenfield, Independence, Medina, Minnetrista, Orono, Rogers",29,107.5,26122.2697674419,"All subrecords apartment (A, AX)",cache/subrecord_data.rds (2024 assessor subrecords)
+Mixed use,"Peers: Rogers, Orono",5,18.76,9291.89765458422,"At least one commercial (C, LC, SL) and one apartment (A, AX) subrecord on the PID",cache/subrecord_data.rds (2024 assessor subrecords)

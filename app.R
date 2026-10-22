@@ -31,7 +31,7 @@ setkey(pid_lookup, PID)
 
 # Natural Systems Score denominators
 ZONATION_7_TOTAL_N       <- app_data$zonation_7_total_n
-NTC_PER_ACRE             <- app_data$ntc_per_acre
+# Offset $/ac rows are built below (offset_stats_built), not from the RDS buckets
 dev_candidates           <- app_data$dev_candidates
 if (is.null(dev_candidates)) dev_candidates <- data.table::data.table()
 BASELINE_AVG_DIST_MILES  <- app_data$baseline_avg_dist_miles
@@ -47,39 +47,197 @@ baseline_levy <- app_data$baseline_levy
 baseline_rate <- app_data$baseline_rate
 total_city_acres <- parcels[, sum(ACREAGE, na.rm = TRUE), by = PID][, sum(V1, na.rm = TRUE)]
 
-zone_colors <- c(
-  "Agricultural"                  = "#F1C40F",   # warm yellow (productive ag)
-  "Agricultural (Transitional)"   = "#FCE96A",   # pale yellow
-  "Residential (High Density)"    = "#08306B",   # dark navy blue
-  "Residential (Medium Density)"  = "#2171B5",   # strong mid blue
-  "Residential (Low Density)"     = "#9ECAE1",   # clear light blue
-  "Mixed Use"                     = "#C44536",   # brick red (moved off gold)
-  "Commercial"                    = "#8E44AD",
-  "Industrial"                    = "#5A6268",
-  "Parks / Recreation"            = "#2D6A4F",   # green (only green left)
-  "Essential Services"            = "#ADB5BD",
-  "Other"                         = "#CCCCCC"
+## Built property type from raw assessor codes ----
+# Built type per PID from the raw PROPERTY_TYPE codes (dayton_parcel_codes.csv,
+# written by build_offset_benchmarks.R). Grouped under main.R's SUPER_MAP groups
+# with these changes (decisions, Oct 2026): townhouse (Y) is its own type;
+# apartments are A/AX plus condos (X/XC) and low-income rentals (apartment
+# buildings); two-unit (DB) and triplex (TP) stay residential, as Hennepin names
+# them. Codes main.R left unmapped go to their main group (D, B, S residential;
+# CR special use), and K is common area (HOA lots, outlots).
+code_groups <- c(
+  R = "Residential", RL = "Residential", RZ = "Residential", RM = "Residential", XM = "Residential",
+  D = "Residential", B = "Residential", S = "Residential", DB = "Residential", TP = "Residential",
+  Y = "Townhome",
+  A = "Apartment", AX = "Apartment", X = "Apartment", XC = "Apartment",
+  HL = "Apartment", HM = "Apartment", HR = "Apartment", HS = "Apartment",
+  C = "Commercial", LC = "Commercial", SL = "Commercial",
+  I = "Industrial", LI = "Industrial",
+  F = "Agricultural", FF = "Agricultural", FP = "Agricultural", LF = "Agricultural",
+  FH = "Agricultural", FM = "Agricultural",
+  LA = "Vacant", LR = "Vacant", LL = "Vacant", LM = "Vacant", LV = "Vacant",
+  SC = "Special use", NC = "Special use", NI = "Special use", GC = "Special use",
+  HF = "Special use", CR = "Special use",
+  ME = "Manufactured homes", MH = "Manufactured homes",
+  K = "Common area"
 )
+# Multi-code PIDs: commercial + any housing = mixed use; any farm subrecord =
+# agricultural; otherwise the most intensive use present wins.
+use_priority <- c("Apartment", "Townhome", "Commercial", "Industrial", "Residential",
+                  "Manufactured homes", "Special use", "Vacant", "Common area", "Unknown")
+built_type_from_codes <- function(codes, acres, in_sim) {
+  vapply(seq_along(codes), function(i) {
+    if (!in_sim[i]) return("Exempt (public, parks, schools)")
+    if (is.na(codes[i]) || codes[i] == "") return("Unknown")
+    grp <- unname(code_groups[strsplit(codes[i], ",", fixed = TRUE)[[1]]])
+    grp <- unique(ifelse(is.na(grp), "Unknown", grp))
+    if ("Commercial" %in% grp && any(c("Residential", "Townhome", "Apartment") %in% grp)) return("Mixed use")
+    if ("Agricultural" %in% grp) return("Agricultural")
+    pick <- intersect(use_priority, grp)[1]
+    # 2-acre split ~ the R-2 "Single-Family Large Lot" minimum (90,000 SF = 2.07 ac),
+    # rounded to 2 (decision, Oct 2026): 2+ ac lots meet Dayton's large-lot standard
+    if (pick == "Residential") {
+      pick <- if (isTRUE(acres[i] >= 2)) "Residential, lot 2 ac or more" else "Residential, lot under 2 ac"
+    }
+    pick
+  }, character(1))
+}
+parcel_codes <- fread("dayton_parcel_codes.csv", colClasses = "character")
+parcel_plats <- fread("dayton_parcel_plats.csv", colClasses = "character")
+geom$codes      <- parcel_codes$codes[match(geom$PID, parcel_codes$PID)]
+geom$plat_name  <- parcel_plats$plat_name[match(geom$PID, parcel_plats$PID)]
+geom$n_groups   <- vapply(strsplit(ifelse(is.na(geom$codes), "", geom$codes), ",", fixed = TRUE),
+                          function(cd) length(unique(code_groups[cd])), integer(1))
+geom$built_type <- built_type_from_codes(geom$codes, geom$acres, geom$in_sim)
+
+## Offset rows ----
+# Replaces the inherited du/acre buckets (1 / 2-6 / >6), which were generic
+# project labels, not Dayton standards. Rows are built property types.
+# $/ac is acre-weighted (sum tax capacity / sum acres), matching data_prep.R.
+# Taxable parcels only (in_sim) with acres > 0; exempt parcels carry no capacity.
+taxable_parcels_df <- as.data.table(sf::st_drop_geometry(geom))[in_sim == TRUE & acres > 0]
+is_subdivision <- function(plat_name) !is.na(plat_name) & !grepl("^unplatted", plat_name, ignore.case = TRUE)
+
+## Offset rows by built type ----
+# $/ac of development: each type's tax capacity over its lot acres plus its
+# share of its subdivision's common lots (K: HOA land, outlots). Common land in
+# a plat is split by each type's share of the plat's other parcels -- a judgment
+# call; splitting by lot acres would give large lots more. This matches how peer
+# apartments (whose grounds sit on the parcel) count land. Dayton rows use single-use PIDs only (one code group).
+# Dayton has 1 apartment parcel and no mixed use, so those rows use peer-city
+# benchmarks (build_offset_benchmarks.R; outer-ring peers).
+subdivision_df <- taxable_parcels_df[is_subdivision(plat_name)]
+plat_common <- subdivision_df[built_type == "Common area",
+                              .(common_ac = sum(acres), common_tc = sum(tax_capacity)), by = plat_name]
+plat_type_share <- subdivision_df[built_type != "Common area", .(n = .N), by = .(plat_name, built_type)][
+  , share := n / sum(n), by = plat_name]
+common_alloc <- merge(plat_type_share, plat_common, by = "plat_name")[
+  , .(alloc_ac = sum(share * common_ac), alloc_tc = sum(share * common_tc)), by = built_type]
+dayton_built_types <- c("Residential, lot under 2 ac", "Residential, lot 2 ac or more",
+                        "Townhome", "Commercial", "Industrial")
+dayton_built_stats <- rbindlist(lapply(dayton_built_types, function(type_name) {
+  type_parcels <- taxable_parcels_df[built_type == type_name & n_groups == 1]
+  alloc    <- common_alloc[built_type == type_name]
+  extra_ac <- if (nrow(alloc)) alloc$alloc_ac else 0
+  extra_tc <- if (nrow(alloc)) alloc$alloc_tc else 0
+  data.table(category   = type_name,
+             parcels    = nrow(type_parcels),
+             acres      = sum(type_parcels$acres) + extra_ac,
+             ntc_per_ac = (sum(type_parcels$tax_capacity) + extra_tc) / (sum(type_parcels$acres) + extra_ac),
+             basis_note = sprintf("Dayton parcels with this use, incl. %s ac share of subdivision common lots",
+                                  formatC(extra_ac, format = "f", digits = 1)))
+}))
+peer_benchmarks <- fread("offset_benchmarks_peers.csv")
+peer_stats <- peer_benchmarks[, .(category   = paste0(category, " (peer cities)"),
+                                  parcels, acres, ntc_per_ac,
+                                  basis_note = paste0("benchmark from ", sub("^[^:]*: ", "", geography)))]
+offset_stats_built <- rbind(dayton_built_stats, peer_stats)
+expected_rows <- c("Residential, lot under 2 ac", "Residential, lot 2 ac or more", "Townhome",
+                   "Apartments (peer cities)", "Mixed use (peer cities)", "Commercial", "Industrial")
+stopifnot(setequal(offset_stats_built$category, expected_rows))
+# Rank rows by $/ac, high to low, keeping the two residential lot-size rows
+# together: the pair sits where its higher-value row (under 2 ac) ranks.
+ranked_rows <- setdiff(offset_stats_built[order(-ntc_per_ac), category], "Residential, lot 2 ac or more")
+ranked_rows <- append(ranked_rows, "Residential, lot 2 ac or more",
+                      after = match("Residential, lot under 2 ac", ranked_rows))
+offset_stats_built <- offset_stats_built[match(ranked_rows, category)]
+
+
+# Residential density family runs light -> dark = low -> high density. The former
+# single "Residential (High Density)" bucket is split into its three underlying
+# zoning districts so RM / RH / R-MH each get a distinct color + legend entry.
+zone_colors <- c(
+  "Agricultural"                     = "#F1C40F",   # warm yellow (productive ag)
+  "Agricultural (Transitional)"      = "#FCE96A",   # pale yellow
+  "High-density multifamily"       = "#08306B",   # darkest navy (highest density)
+  "Townhome / multifamily"    = "#2171B5",   # strong blue
+  "Manufactured home park"              = "#EC7014",   # orange (distinct housing type)
+  "Residential (Medium Density)"     = "#6BAED6",   # mid-light blue (SF / townhome)
+  "Residential (Low Density)"        = "#C6DBEF",   # lightest blue (large lot)
+  "Mixed Use"                        = "#C44536",   # brick red (moved off gold)
+  "Commercial"                       = "#8E44AD",
+  "Industrial"                       = "#5A6268",
+  "Parks / Recreation"               = "#2D6A4F",   # green (only green left)
+  "Essential Services"               = "#ADB5BD",
+  "Other"                            = "#CCCCCC"
+)
+# Map a zone_code + its display_category to a color key: split the three
+# high-density districts by code, otherwise fall back to the display_category.
+zone_color_cat <- function(code, disp) {
+  out <- as.character(disp)
+  out[code %in% "R-M"]  <- "Townhome / multifamily"
+  out[code %in% "RH"]   <- "High-density multifamily"
+  out[code %in% "R-MH"] <- "Manufactured home park"
+  out
+}
 zone_pal <- colorFactor(unname(zone_colors), levels = names(zone_colors),
                         ordered = TRUE, na.color = "#CCCCCC")
 
-# Display labels: show the unit/acre range instead of the broad density word.
-# Internal `display_category` values are kept as logic/color keys; only the
-# user-facing text is relabeled. Ranges are the project's generic densities
-# (city_report.qmd) — confirm against Dayton's zoning ordinance before relying
-# on the exact thresholds.
+# Display labels: housing-type names shared by the legend, hover and offset rows.
+# Internal `display_category` values stay as logic/color keys; only user-facing
+# text is relabeled. (Replaced the old generic du/acre ranges 1 / 2-6 / >6.)
 density_range_labels <- c(
-  "Residential (Low Density)"    = "Residential (1)",
-  "Residential (Medium Density)" = "Residential (2-6)",
-  "Residential (High Density)"   = "Residential (>6)"
+  "Residential (Low Density)"    = "Large-lot single-family",
+  "Residential (Medium Density)" = "Single-family",
+  "Residential (High Density)"   = "Multifamily",  # fallback only; RM/RH/R-MH are split by color_cat
+  # data_prep.R keys A-2 (and the retired A-3) as "Transitional"; in the current
+  # code A-2 is the Special Homestead Agricultural district, so relabel for display
+  "Agricultural (Transitional)"  = "Agricultural (Homestead)"
 )
+# Zoning districts appended to legend entries so the map reads without the modal
+legend_district_codes <- c(
+  "Residential (Low Density)"    = "R-E, R-2",
+  "Residential (Medium Density)" = "R-1, R-1A, R-3, R-O",
+  "Townhome / multifamily"       = "RM",
+  "High-density multifamily"     = "RH",
+  "Manufactured home park"       = "R-MH"
+)
+zone_legend_labels <- function(keys) {
+  lbl   <- relabel_density(keys)
+  codes <- unname(legend_district_codes[keys])
+  ifelse(is.na(codes), lbl, paste0(lbl, " (", codes, ")"))
+}
 relabel_density <- function(x) {
   out <- unname(density_range_labels[as.character(x)])
   ifelse(is.na(out), as.character(x), out)
 }
 # Carry a display-only label alongside the logic key
-zoning$disp_label <- relabel_density(zoning$display_category)
-geom$disp_label   <- relabel_density(geom$display_category)
+# Color key that splits RM / RH / R-MH out of the aggregated high-density bucket
+zoning$color_cat  <- zone_color_cat(zoning$zone_code, zoning$display_category)
+geom$color_cat    <- zone_color_cat(geom$zone_code, geom$display_category)
+zoning$disp_label <- relabel_density(zoning$color_cat)
+geom$disp_label   <- relabel_density(geom$color_cat)
+
+## Built type colors (map) ----
+built_colors <- c(
+  "Residential, lot under 2 ac"     = "#6BAED6",
+  "Residential, lot 2 ac or more"   = "#C6DBEF",
+  "Townhome"                        = "#41B6C4",
+  "Apartment"                       = "#08519C",
+  "Manufactured homes"              = "#EC7014",
+  "Mixed use"                       = "#C44536",
+  "Commercial"                      = "#8E44AD",
+  "Industrial"                      = "#5A6268",
+  "Agricultural"                    = "#F1C40F",
+  "Vacant"                          = "#E6DCC3",
+  "Common area"                     = "#E5DAF0",
+  "Special use"                     = "#ADB5BD",
+  "Exempt (public, parks, schools)" = "#B7D3B0",
+  "Unknown"                         = "#CCCCCC"
+)
+stopifnot(all(geom$built_type %in% names(built_colors)))
+built_pal <- colorFactor(unname(built_colors), levels = names(built_colors),
+                         ordered = TRUE, na.color = "#CCCCCC")
 
 # Zonation palette: 0 = no data (grey), 1-7 = yellow → dark green ramp
 zonation_colors <- c(
@@ -110,56 +268,84 @@ ui <- fluidPage(
 
   titlePanel("Dayton Conservation Easement Tax Simulator"),
 
+  tags$details(open = NA,
+    style = "margin:0 15px 10px; padding:8px 14px; background:#F0F7F4; border:1px solid #CBE3D8; border-radius:6px; font-size:13px;",
+    tags$summary(style = "cursor:pointer; font-weight:600; color:#1B4332;",
+                 "How to use this tool"),
+    tags$ol(style = "margin:8px 0 2px; padding-left:20px; line-height:1.6; color:#333;",
+      tags$li("Click a parcel on the map to place it under a conservation easement. Click it again to remove it."),
+      tags$li("The panel on the right recalculates live: the city's total tax capacity falls, the tax rate rises to raise the same fixed levy, and that increase is shifted onto the remaining (non-easement) parcels."),
+      tags$li("Use the Deduction rate slider to model a partial easement (anything less than a full tax exemption)."),
+      tags$li("Switch the map between Built type and Zoning at its top-left; the Parcels checkbox at the top-right turns that coloring on or off. Natural Value Score, Protected Land and Existing Easements are in the same control."),
+      tags$li("The Definitions and Methodology buttons at the bottom of the panel explain every term and formula.")
+    )
+  ),
+
   fluidRow(
-    column(8, leafletOutput("map", height = "88vh")),
+    column(8, div(style = "position:relative;",
+      leafletOutput("map", height = "88vh"),
+      # Map fill toggle; the "Parcels" checkbox in the layer control turns it on/off
+      absolutePanel(top = 10, left = 55, draggable = FALSE,
+        style = "background:rgba(255,255,255,0.92); padding:4px 10px 0; border-radius:4px; box-shadow:0 1px 4px rgba(0,0,0,0.3); z-index:1000;",
+        radioButtons("map_fill", label = NULL, choices = c("Built type", "Zoning"),
+                     selected = "Built type", inline = TRUE)))),
     column(4, div(class = "sidebar",
-      div(style = "background:#1B4332; color:white; padding:12px 14px; border-radius:6px; margin-bottom:14px;",
-          div(style = "font-size:13px; opacity:0.85; letter-spacing:0.5px; margin-bottom:12px;",
-              "NATURAL SYSTEMS SCORES"),
-
-          # --- Score 1: High Priority Parcels ---
-          div(style = "margin-bottom:12px;",
-            div(style = "display:flex; justify-content:space-between; align-items:baseline;",
-                tags$span(style = "font-size:13px;", "High Priority Parcels"),
-                tags$span(style = "font-size:18px; font-weight:700;",
-                          textOutput("s1_value", inline = TRUE),
-                          tags$span("/100", style = "font-size:12px; opacity:0.7;"))),
-            div(style = "margin-top:4px; background:rgba(255,255,255,0.15); height:6px; border-radius:3px; overflow:hidden;",
-                div(class = "s1bar", style = "height:100%; background:#52B788; width:0%; transition:width 0.3s;")),
-            div(style = "font-size:10px; opacity:0.75; margin-top:3px;",
-                textOutput("s1_detail", inline = TRUE))),
-
-          # --- Score 2: Connectedness ---
-          div(style = "margin-bottom:12px;",
-            div(style = "display:flex; justify-content:space-between; align-items:baseline;",
-                tags$span(style = "font-size:13px;", "Connectedness"),
-                tags$span(style = "font-size:18px; font-weight:700;",
-                          textOutput("s2_value", inline = TRUE),
-                          tags$span("/100", style = "font-size:12px; opacity:0.7;"))),
-            div(style = "margin-top:4px; background:rgba(255,255,255,0.15); height:6px; border-radius:3px; overflow:hidden;",
-                div(class = "s2bar", style = "height:100%; background:#52B788; width:0%; transition:width 0.3s;")),
-            div(style = "font-size:10px; opacity:0.75; margin-top:3px;",
-                textOutput("s2_detail", inline = TRUE))),
-
-          # --- Score 3: Distance Reduction ---
-          div(style = "margin-bottom:6px;",
-            div(style = "display:flex; justify-content:space-between; align-items:baseline;",
-                tags$span(style = "font-size:13px;", "Distance to Protected"),
-                tags$span(style = "font-size:18px; font-weight:700;",
-                          textOutput("s3_value", inline = TRUE),
-                          tags$span("/100", style = "font-size:12px; opacity:0.7;"))),
-            div(style = "margin-top:4px; background:rgba(255,255,255,0.15); height:6px; border-radius:3px; overflow:hidden;",
-                div(class = "s3bar", style = "height:100%; background:#52B788; width:0%; transition:width 0.3s;")),
-            div(style = "font-size:10px; opacity:0.75; margin-top:3px;",
-                textOutput("s3_detail", inline = TRUE)))
-      ),
-      tags$script(HTML(
-        "Shiny.addCustomMessageHandler('scorebars', function(pct) {
-           document.querySelector('.s1bar').style.width = pct.s1 + '%';
-           document.querySelector('.s2bar').style.width = pct.s2 + '%';
-           document.querySelector('.s3bar').style.width = pct.s3 + '%';
-         });"
-      )),
+      # --- Natural Systems Scores panel commented out (Aug 2026) ---------------
+      # (High Priority Parcels / Connectedness / Distance to Protected, plus the
+      #  scorebars JS handler). Server-side score math still computes but is unused;
+      #  re-enable this block + the scorebars observe/output bindings to restore.
+      # div(style = "background:#1B4332; color:white; padding:12px 14px; border-radius:6px; margin-bottom:14px;",
+      #     div(style = "font-size:13px; opacity:0.85; letter-spacing:0.5px; margin-bottom:12px;",
+      #         "NATURAL SYSTEMS SCORES"),
+      #     # --- Score 1: High Priority Parcels ---
+      #     div(style = "margin-bottom:12px;",
+      #       div(style = "display:flex; justify-content:space-between; align-items:baseline;",
+      #           tags$span(style = "font-size:13px;", "High Priority Parcels"),
+      #           tags$span(style = "font-size:18px; font-weight:700;",
+      #                     textOutput("s1_value", inline = TRUE),
+      #                     tags$span("/100", style = "font-size:12px; opacity:0.7;"))),
+      #       div(style = "margin-top:4px; background:rgba(255,255,255,0.15); height:6px; border-radius:3px; overflow:hidden;",
+      #           div(class = "s1bar", style = "height:100%; background:#52B788; width:0%; transition:width 0.3s;")),
+      #       div(style = "font-size:10px; opacity:0.75; margin-top:3px;",
+      #           textOutput("s1_detail", inline = TRUE))),
+      #     # --- Score 2: Connectedness ---
+      #     div(style = "margin-bottom:12px;",
+      #       div(style = "display:flex; justify-content:space-between; align-items:baseline;",
+      #           tags$span(style = "font-size:13px;", "Connectedness"),
+      #           tags$span(style = "font-size:18px; font-weight:700;",
+      #                     textOutput("s2_value", inline = TRUE),
+      #                     tags$span("/100", style = "font-size:12px; opacity:0.7;"))),
+      #       div(style = "margin-top:4px; background:rgba(255,255,255,0.15); height:6px; border-radius:3px; overflow:hidden;",
+      #           div(class = "s2bar", style = "height:100%; background:#52B788; width:0%; transition:width 0.3s;")),
+      #       div(style = "font-size:10px; opacity:0.75; margin-top:3px;",
+      #           textOutput("s2_detail", inline = TRUE))),
+      #     # --- Score 3: Distance Reduction ---
+      #     div(style = "margin-bottom:6px;",
+      #       div(style = "display:flex; justify-content:space-between; align-items:baseline;",
+      #           tags$span(style = "font-size:13px;", "Distance to Protected"),
+      #           tags$span(style = "font-size:18px; font-weight:700;",
+      #                     textOutput("s3_value", inline = TRUE),
+      #                     tags$span("/100", style = "font-size:12px; opacity:0.7;"))),
+      #       div(style = "margin-top:4px; background:rgba(255,255,255,0.15); height:6px; border-radius:3px; overflow:hidden;",
+      #           div(class = "s3bar", style = "height:100%; background:#52B788; width:0%; transition:width 0.3s;")),
+      #       div(style = "font-size:10px; opacity:0.75; margin-top:3px;",
+      #           textOutput("s3_detail", inline = TRUE)))
+      # ),
+      # tags$script(HTML(
+      #   "Shiny.addCustomMessageHandler('scorebars', function(pct) {
+      #      document.querySelector('.s1bar').style.width = pct.s1 + '%';
+      #      document.querySelector('.s2bar').style.width = pct.s2 + '%';
+      #      document.querySelector('.s3bar').style.width = pct.s3 + '%';
+      #    });"
+      # )),
+      # Tax shift summary, compact and first: the headline effect of the selection
+      div(style = "background:#F2F2F2; border:1px solid #DDDDDD; border-radius:6px; padding:8px 10px; margin-bottom:12px;",
+          div(style = "font-size:11px; font-weight:600; color:#555; text-transform:uppercase; margin-bottom:4px;",
+              "Tax increase on remaining parcels"),
+          div(style = "display:flex; justify-content:space-between; gap:8px; font-size:10px; color:#666;",
+              div(div("Total shifted"),  div(style = "font-size:14px; font-weight:600; color:#333;", textOutput("total_shift", inline = TRUE))),
+              div(div("Avg per parcel"), div(style = "font-size:14px; font-weight:600; color:#333;", textOutput("avg_shift", inline = TRUE))),
+              div(div("Avg % increase"), div(style = "font-size:14px; font-weight:600; color:#333;", textOutput("avg_pct_shift", inline = TRUE))))),
       h4("City fiscal dashboard"),
       div(class = "metric",
           div(class = "label", "2024 City Levy (fixed)"),
@@ -190,57 +376,55 @@ ui <- fluidPage(
           div(class = "value", textOutput("off_ea_per_ac", inline = TRUE))),
       hr(),
       h4("Densification offset"),
+      div(style = "font-size:10px; color:#888; margin:-4px 0 6px; line-height:1.4;",
+          "By built property type: what each use yields per acre today."),
       div(style = "font-size:10px; color:#888; text-transform:uppercase; margin-bottom:4px;",
           "Acres needed to offset"),
       uiOutput("offset_rows"),
-      tags$hr(style = "margin:8px 0; border-top:1px dashed #ccc;"),
-      div(style = "font-size:10px; color:#888; text-transform:uppercase; margin-bottom:4px;",
-          "Suggested development (black layer)"),
-      div(class = "metric",
-          div(class = "label", "Parcels to develop"),
-          div(class = "value", textOutput("sug_n", inline = TRUE))),
-      div(class = "metric",
-          div(class = "label", "Total acres"),
-          div(class = "value", textOutput("sug_ac", inline = TRUE))),
-      div(class = "metric",
-          div(class = "label", "Tax capacity gained"),
-          div(class = "value", textOutput("sug_gain", inline = TRUE))),
-      div(class = "metric",
-          div(class = "label", "Net vs. lost capacity"),
-          div(class = "value", textOutput("sug_net", inline = TRUE)),
-          div(class = "delta", textOutput("sug_coverage", inline = TRUE))),
-      div(class = "metric",
-          div(class = "label", "Within current zoning"),
-          div(class = "value", textOutput("sug_infill_count", inline = TRUE))),
-      div(class = "metric",
-          div(class = "label", "Would need rezone"),
-          div(class = "value", textOutput("sug_rezone_count", inline = TRUE))),
-      uiOutput("sug_by_type"),
-      p(style = "font-size:10px; color:#888; margin-top:4px;",
-        "Optimization priorities (in order): (1) vacant infill lots first, ",
-        "(2) highest $/acre gain, (3) minimize land used, ",
-        "(4) prefer parcels near existing residential. ",
-        "Toggle 'Suggested Development' in the layer control to view."),
+      # --- Suggested Development (black layer) subsection commented out (Aug 2026) ---
+      # Greedy per-parcel development picks + map layer disabled. Densification
+      # offset (acres-needed-by-type, above) is retained. Re-enable this block,
+      # the "Suggested Development" map layer/observe, and the sug_* output
+      # bindings to restore.
+      # tags$hr(style = "margin:8px 0; border-top:1px dashed #ccc;"),
+      # div(style = "font-size:10px; color:#888; text-transform:uppercase; margin-bottom:4px;",
+      #     "Suggested development (black layer)"),
+      # div(class = "metric",
+      #     div(class = "label", "Total acres to develop"),
+      #     div(class = "value", textOutput("sug_ac", inline = TRUE))),
+      # div(class = "metric",
+      #     div(class = "label", "Tax capacity gained"),
+      #     div(class = "value", textOutput("sug_gain", inline = TRUE))),
+      # div(class = "metric",
+      #     div(class = "label", "Net vs. lost capacity"),
+      #     div(class = "value", textOutput("sug_net", inline = TRUE)),
+      #     div(class = "delta", textOutput("sug_coverage", inline = TRUE))),
+      # div(class = "metric",
+      #     div(class = "label", "Within current zoning"),
+      #     div(class = "value", textOutput("sug_infill_count", inline = TRUE))),
+      # div(class = "metric",
+      #     div(class = "label", "Would need rezone"),
+      #     div(class = "value", textOutput("sug_rezone_count", inline = TRUE))),
+      # uiOutput("sug_by_type"),
+      # p(style = "font-size:10px; color:#888; margin-top:4px;",
+      #   "Optimization priorities (in order): (1) vacant infill lots first, ",
+      #   "(2) highest $/acre gain, (3) minimize land used, ",
+      #   "(4) prefer parcels near existing residential. ",
+      #   "Toggle 'Suggested Development' in the layer control to view."),
       hr(),
-      h4("Tax increase on remaining parcels"),
-      p(style = "font-size:12px; color:#666; margin-top:-8px;",
-        "The city still collects the same levy, so easement-eligible capacity ",
-        "is picked up by non-easement parcels."),
-      div(class = "metric",
-          div(class = "label", "Total tax shifted to remaining parcels"),
-          div(class = "value", textOutput("total_shift", inline = TRUE))),
-      div(class = "metric",
-          div(class = "label", "Average tax increase (per remaining parcel)"),
-          div(class = "value", textOutput("avg_shift", inline = TRUE))),
-      div(class = "metric",
-          div(class = "label", "Average % tax increase (per remaining parcel)"),
-          div(class = "value", textOutput("avg_pct_shift", inline = TRUE))),
-      br(),
       actionButton("reset", "Reset", width = "100%",
                    icon = icon("rotate-left")),
       br(), br(),
-      actionButton("show_methodology", "View Methodology",
+      actionButton("show_definitions", "Definitions",
+                   width = "100%", icon = icon("book"),
+                   style = "background:#fff; border:1px solid #ccc;"),
+      br(), br(),
+      actionButton("show_methodology", "Methodology",
                    width = "100%", icon = icon("info-circle"),
+                   style = "background:#fff; border:1px solid #ccc;"),
+      br(), br(),
+      actionButton("show_zoning_density", "Zoning density",
+                   width = "100%", icon = icon("table"),
                    style = "background:#fff; border:1px solid #ccc;"),
       br(), br(),
       p(style = "font-size:11px; color:#888;",
@@ -258,12 +442,22 @@ server <- function(input, output, session) {
   output$map <- renderLeaflet({
     leaflet() |>
       addTiles(group = "OpenStreetMap") |>
+      # Two fills (zoning polygons, parcels by built use) toggled by input$map_fill.
+      # Both are non-interactive so clicks reach the parcel click layer on top.
       addPolygons(data = zoning,
-                  fillColor = ~zone_pal(display_category),
+                  fillColor = ~zone_pal(color_cat),
                   fillOpacity = 0.80, color = "#444", weight = 0.4,
                   group = "Zoning",
-                  label = ~paste0(zone_code, " — ", zone_name,
-                                  " (", disp_label, ")")) |>
+                  options = pathOptions(interactive = FALSE)) |>
+      addPolygons(data = geom,
+                  fillColor = ~built_pal(built_type),
+                  fillOpacity = 0.80, color = "#444", weight = 0.4,
+                  group = "Built type",
+                  options = pathOptions(interactive = FALSE)) |>
+      # Parcel outlines: the "Parcels" master switch
+      addPolygons(data = geom, fill = FALSE, color = "#00000030", weight = 0.3,
+                  group = "Parcels", options = pathOptions(interactive = FALSE)) |>
+      # Click / hover layer: always on (not in the layer control)
       addPolygons(data = geom,
                   layerId = ~PID,
                   fillColor = "#ffffff", fillOpacity = 0,
@@ -271,13 +465,13 @@ server <- function(input, output, session) {
                   highlightOptions = highlightOptions(
                     weight = 2.5, color = "#000", fillOpacity = 0,
                     bringToFront = TRUE),
-                  group = "Parcels",
+                  group = "parcel_click",
                   label = ~lapply(paste0(
                     "<b>PID ", PID, "</b>",
                     ifelse(in_sim, "", " <i>(exempt)</i>"), "<br>",
                     "Zone: ", ifelse(is.na(zone_code), "—",
                                      paste0(zone_code, " (", disp_label, ")")), "<br>",
-                    "Zonation priority: ", priority_score, "/7<br>",
+                    "Natural Value Score: ", priority_score, "/7<br>",
                     "Tax capacity: ",
                     ifelse(in_sim,
                            paste0("$", formatC(tax_capacity, format = "d", big.mark = ",")),
@@ -285,7 +479,11 @@ server <- function(input, output, session) {
                     "Acres: ",
                     ifelse(is.na(acres), "n/a",
                            formatC(acres, digits = 2, format = "f")), "<br>",
-                    "Type: ", prop_type
+                    "Built type: ", built_type, "<br>",
+                    "Tax capacity / acre: ",
+                    ifelse(in_sim & !is.na(acres) & acres > 0,
+                           paste0("$", formatC(round(tax_capacity / acres), format = "d", big.mark = ",")),
+                           "n/a")
                   ), htmltools::HTML)) |>
       addPolygons(data = parks,
                   fill = FALSE,
@@ -308,28 +506,48 @@ server <- function(input, output, session) {
       addPolygons(data = geom,
                   fillColor = ~zonation_pal(as.character(priority_score)),
                   fillOpacity = 0.75, stroke = FALSE,
-                  group = "Zonation Priority",
+                  group = "Natural Value Score",
                   options = pathOptions(interactive = FALSE),
-                  label = ~paste0("Zonation priority: ", priority_score, "/7")) |>
+                  label = ~paste0("Natural Value Score: ", priority_score, "/7")) |>
       addLayersControl(
-        overlayGroups = c("Zoning", "Zonation Priority", "Parcels",
-                          "Protected Land", "Existing Easements",
-                          "Suggested Development"),
+        overlayGroups = c("Parcels", "Natural Value Score",
+                          "Protected Land", "Existing Easements"),
         options = layersControlOptions(collapsed = FALSE)) |>
-      hideGroup("Zonation Priority") |>
-      hideGroup("Suggested Development") |>
-      addLegend("bottomleft", colors = unname(zone_colors),
-                labels = relabel_density(names(zone_colors)), title = "Zoning",
-                opacity = 0.8, group = "Zoning") |>
+      # Zoning / Built type legends are swapped by the map-fill observer below
+      # (leaflet only auto-hides legends for groups in the layer control)
       addLegend("bottomleft", pal = zonation_pal,
                 values = names(zonation_colors),
-                title = "Zonation priority<br><small>0 = no data, 7 = highest</small>",
-                opacity = 0.8, group = "Zonation Priority") |>
+                title = "Natural Value Score<br><small>1 = low, 7 = highest conservation value; 0 = not scored</small>",
+                opacity = 0.8, group = "Natural Value Score") |>
+      # Hide after the legends are added so the legends start hidden too
+      hideGroup(c("Natural Value Score", "Zoning")) |>
       fitBounds(
         lng1 = min(st_bbox(geom)[["xmin"]], st_bbox(zoning)[["xmin"]]),
         lat1 = min(st_bbox(geom)[["ymin"]], st_bbox(zoning)[["ymin"]]),
         lng2 = max(st_bbox(geom)[["xmax"]], st_bbox(zoning)[["xmax"]]),
         lat2 = max(st_bbox(geom)[["ymax"]], st_bbox(zoning)[["ymax"]]))
+  })
+
+  # ---- map fill: built type vs zoning, gated by the "Parcels" checkbox ----
+  observe({
+    visible_groups <- input$map_groups
+    parcels_on <- is.null(visible_groups) || "Parcels" %in% visible_groups
+    fill       <- if (is.null(input$map_fill)) "Built type" else input$map_fill
+    proxy      <- leafletProxy("map") |> removeControl("fill_legend")
+    if (parcels_on) {
+      proxy |> showGroup(fill) |> hideGroup(setdiff(c("Zoning", "Built type"), fill))
+      if (fill == "Zoning") {
+        proxy |> addLegend("bottomleft", colors = unname(zone_colors),
+                           labels = zone_legend_labels(names(zone_colors)), title = "Zoning",
+                           opacity = 0.8, layerId = "fill_legend")
+      } else {
+        proxy |> addLegend("bottomleft", colors = unname(built_colors),
+                           labels = names(built_colors), title = "Built type",
+                           opacity = 0.8, layerId = "fill_legend")
+      }
+    } else {
+      proxy |> hideGroup(c("Zoning", "Built type"))
+    }
   })
 
   # ---- parcel click toggles selection ----------------------------------
@@ -349,13 +567,114 @@ server <- function(input, output, session) {
     if (pid %in% cur) selected(setdiff(cur, pid)) else selected(c(cur, pid))
   })
 
+  observeEvent(input$show_definitions, {
+    dfn <- function(term, ...) tags$p(style = "margin:6px 0;",
+      tags$b(term), " — ", ...)
+    showModal(modalDialog(
+      title = "Definitions",
+      size = "l", easyClose = TRUE,
+      dfn("Natural Value Score",
+          "A 1–7 conservation-priority ranking from the Zonation analysis: 1 = lowest, ",
+          "7 = highest natural/conservation value (top ~1%); 0 = not scored. ",
+          "Higher scores flag land most valuable to protect."),
+      dfn("Tax Capacity",
+          "A parcel's taxable value after Minnesota class rates are applied ",
+          "(market value × class rate, which varies by property type). ",
+          "Property taxes are levied against tax capacity, not market value."),
+      dfn("Levy",
+          "The fixed dollar amount the city must raise from property taxes each year. ",
+          "It is held constant in this tool — easements don't change what the city needs, ",
+          "only who pays it."),
+      dfn("Tax Rate",
+          "Levy ÷ total tax capacity. When easements remove tax capacity, the rate must ",
+          "rise so the same levy is still collected."),
+      dfn("Conservation Easement",
+          "A permanent legal restriction on a parcel. Here it removes the parcel's ",
+          "eligible tax capacity from the city's tax base in exchange for protection."),
+      dfn("Deduction Rate",
+          "How much of a selected parcel's tax capacity the easement removes: ",
+          "100% = a full exemption, lower values = a partial easement."),
+      dfn("Lost Tax Capacity",
+          "The total tax capacity removed by the easements you have selected."),
+      dfn("Tax Shift",
+          "Because the levy is fixed, the lost tax capacity is redistributed onto the ",
+          "remaining parcels as a higher tax bill. Shown in total and per remaining parcel."),
+      dfn("Densification Offset",
+          "How much new development — expressed in acres by type — would generate enough ",
+          "tax capacity to replace what the easements removed, at the current average ",
+          "tax capacity per acre for that built property type (Dayton parcels, with ",
+          "peer-city benchmarks for apartments and mixed use)."),
+      dfn("Suggested Development",
+          "An illustrative, automated set of candidate parcels whose development would ",
+          "offset the lost capacity. It is a what-if scenario, not a recommendation to ",
+          "develop any specific property."),
+      tags$hr(),
+      tags$p(style = "font-size:12px; color:#888;",
+             "For the underlying formulas and data sources, see the ",
+             tags$b("Methodology"), " button."),
+      footer = modalButton("Close")
+    ))
+  })
+
+  observeEvent(input$show_zoning_density, {
+    zrow <- function(zone, dist, lot, dens, label)
+      tags$tr(
+        tags$td(style = "padding:3px 10px 3px 0;", tags$b(zone)),
+        tags$td(style = "padding:3px 10px 3px 0;", dist),
+        tags$td(style = "padding:3px 10px 3px 0; white-space:nowrap;", lot),
+        tags$td(style = "padding:3px 10px 3px 0; white-space:nowrap;", dens),
+        tags$td(style = "padding:3px 0; color:#555;", label))
+    grp <- function(txt) tags$tr(
+      tags$td(colspan = 5, style = "padding:10px 0 2px; font-weight:700; color:#1B4332; border-bottom:1px solid #ddd;", txt))
+    showModal(modalDialog(
+      title = "Zoning density — Dayton City Code",
+      size = "l", easyClose = TRUE,
+      tags$p(style = "font-size:13px; color:#444;",
+        "Maximum dwelling units per acre allowed in each Dayton zoning district. ",
+        "R-3, RM and RH are set as ", tags$i("net"), " density (the code excludes wetlands, ",
+        "water, park dedication, arterial streets and the Greenway Corridor from the acreage). ",
+        "The right-hand column shows the category each district falls under in the tool."),
+      tags$table(style = "font-size:12px; border-collapse:collapse; width:100%;",
+        tags$tr(
+          tags$td(style = "padding:2px 10px 6px 0; font-size:10px; text-transform:uppercase; color:#888;", "Zone"),
+          tags$td(style = "padding:2px 10px 6px 0; font-size:10px; text-transform:uppercase; color:#888;", "District"),
+          tags$td(style = "padding:2px 10px 6px 0; font-size:10px; text-transform:uppercase; color:#888;", "Min lot"),
+          tags$td(style = "padding:2px 10px 6px 0; font-size:10px; text-transform:uppercase; color:#888;", "Density (u/ac)"),
+          tags$td(style = "padding:2px 0 6px; font-size:10px; text-transform:uppercase; color:#888;", "Category in tool")),
+        grp("Lower-density residential"),
+        zrow("R-E", "Residential Estate",      "5 ac",      "0.20",  "Large-lot single-family"),
+        zrow("R-2", "Single-Family Large Lot",  "90,000 SF", "0.48",  "Large-lot single-family"),
+        grp("Medium-density residential"),
+        zrow("R-1",  "Single-Family",            "15,000 SF", "~2.9",  "Single-family"),
+        zrow("R-1A", "SF with Lot Averaging",    "10,000 SF", "~4.4",  "Single-family"),
+        zrow("R-3",  "SF Attached & Detached",   "6,500 SF",  "2–4 net","Single-family"),
+        zrow("R-O",  "Historic Village Res.",    "9,000 SF",  "~4.8",  "Single-family"),
+        grp("Higher-density residential"),
+        zrow("RM",   "Medium Density Res.",      "9,000 SF",  "6–12 net","Townhome / multifamily"),
+        zrow("RH",   "High Density Res.",        "2 ac",      "10+ net", "High-density multifamily (none zoned)"),
+        zrow("R-MH", "Manufactured Home",        "3,600 SF",  "~12",   "Manufactured home park"),
+        grp("Agricultural"),
+        zrow("S-A / A-1", "(Special) Agricultural", "40 ac", "0.025", "Agricultural"),
+        zrow("A-2",  "Special Homestead Ag.",    "2.5 ac",    "0.025", "Agricultural")
+      ),
+      tags$hr(),
+      tags$p(style = "font-size:11px; color:#888;",
+        "Source: Dayton City Code §1001.05 Residential Districts (American Legal, 2026 S-12). ",
+        "RH density is a minimum floor (10 u/ac \"or greater\", no maximum). ",
+        "A former \"A-3 Agricultural (Transitional)\" district is not in the current code. ",
+        "Business, industrial and mixed-use districts have no fixed dwelling-density standard. ",
+        "Full values with per-district sources: data/dayton_zoning_density.csv."),
+      footer = modalButton("Close")
+    ))
+  })
+
   observeEvent(input$show_methodology, {
     showModal(modalDialog(
-      title = "Methodology & Definitions",
+      title = "Methodology",
       size = "l", easyClose = TRUE,
       tags$h4("Natural Systems Scores"),
-      tags$p(tags$b("1. High Priority Parcels"), " — fraction of Dayton's zonation-7 (top ~1% of conservation priority) parcels placed in easement."),
-      tags$code("score = 100 × (# zonation-7 parcels selected) / (# zonation-7 parcels in Dayton)"),
+      tags$p(tags$b("1. High Priority Parcels"), " — fraction of Dayton's top Natural Value Score parcels (score 7, top ~1% of conservation priority) placed in easement."),
+      tags$code("score = 100 × (# score-7 parcels selected) / (# score-7 parcels in Dayton)"),
       tags$p(tags$b("2. Connectedness"), " — fraction of your selections adjacent to at least one other selection. Parks / existing easements do not count here (they're scored in #3). Requires ≥ 2 selections."),
       tags$code("score = 100 × (# selections touching another selection) / (# selected)"),
       tags$p(tags$b("3. Distance to Protected"), " — reduction in the average distance from unprotected parcel centroids to the nearest protected region (parks + existing easements + your selections, dissolved)."),
@@ -379,7 +698,7 @@ server <- function(input, output, session) {
       tags$p(tags$b("Lost capacity per acre"), " — average $ of tax capacity lost per easement acre in your scenario:"),
       tags$code("ea_per_ac = ntc_removed / easement_acres"),
       tags$p("This is specific to your selection mix. Ag land is ~$150–400/ac; residential or commercial parcels drive it much higher."),
-      tags$p(tags$b("Acres needed by type"), " — how many acres of each development type would have to exist at Dayton's current average $/acre for that type to recoup the lost capacity:"),
+      tags$p(tags$b("Acres needed by type"), " — how many acres of each development type would have to exist at the current average $/acre for that type to recoup the lost capacity. Types are Dayton parcels by actual assessor property type (residential split at a 2-acre lot, about the R-2 large-lot minimum; townhomes separate), each counted with its share of subdivision common lots. Apartments and mixed use are benchmarked on outer-ring peer cities (Thrive 2040 Suburban Edge / Emerging Suburban Edge Hennepin cities, excluding Plymouth and Maple Grove; mixed use from Rogers and Orono) because Dayton has almost none built."),
       tags$code("offset_acres[type] = ntc_removed / ntc_per_ac[type]"),
       tags$p(tags$b("Equivalency ratio"), " — how many easement acres one acre of that development type offsets:"),
       tags$code("ratio = ntc_per_ac[type] / ea_per_ac"),
@@ -392,13 +711,13 @@ server <- function(input, output, session) {
       tags$hr(),
       tags$h4("Suggested Development (Black Layer)"),
       tags$p("A greedy optimizer proposes parcels to upzone/build on that would offset the tax capacity your easements removed. Toggle the layer via the map's layer control."),
-      tags$p(tags$b("Candidates"), " — taxable parcels that are either (a) in Agricultural / Agricultural (Transitional) / Other zoning, or (b) have a vacant property type, and are not already protected or user-selected."),
+      tags$p(tags$b("Candidates"), " — taxable parcels that are either (a) in Agricultural / Agricultural (Homestead) / Other zoning, or (b) have a vacant property type, and are not already protected or user-selected."),
       tags$p(tags$b("Filters applied to candidates:")),
       tags$ul(
         tags$li(tags$b("Min area ≥ 1 acre"), " — drops sliver remnants."),
         tags$li(tags$b("Polsby-Popper compactness ≥ 0.25"), " — drops long thin shapes (railroad / utility ROWs, drainage and stormwater strips). Formula: 4π × area / perimeter², where 0 = infinitely thin, 1 = perfect circle."),
         tags$li(tags$b("< 50% wetland overlap"), " — drops parcels protected from construction by regulation (NWI)."),
-        tags$li(tags$b("Zonation score < 5"), " — excludes high conservation-priority land (top ~25% by Zonation) from development candidates. Vacant wooded/natural areas with high conservation value shouldn't be suggested for paving, even if zoning allows it."),
+        tags$li(tags$b("Natural Value Score < 5"), " — excludes high conservation-priority land (top ~25% by Natural Value Score) from development candidates. Vacant wooded/natural areas with high conservation value shouldn't be suggested for paving, even if zoning allows it."),
         tags$li(tags$b("Current NTC/acre ≥ $50"), " — drops absurdly under-assessed parcels (holding ponds, drainage easements, sewer tracts) that are often valued at ~$1 even when zoning allows development."),
         tags$li(tags$b("Landlocked parcels are NOT filtered"), " yet — would require a road-network dataset.")
       ),
@@ -417,7 +736,7 @@ server <- function(input, output, session) {
         tags$li(tags$b("Assessor extract (2024):"), " parcels, tax capacity, subrecords, property types, priority subrecord flags."),
         tags$li(tags$b("Met Council open parcels GDB:"), " tax-exempt parcels (parks, municipal, schools)."),
         tags$li(tags$b("HC established easements:"), " closed conservation easements (MCWD filtered out, multi-PID easements split proportionally)."),
-        tags$li(tags$b("Zonation priority rankings:"), " kristine_parcel_coded_zonation; score 1 = 0–25th pct, 7 = 99–100th pct."),
+        tags$li(tags$b("Natural Value Score (Zonation conservation prioritization):"), " kristine_parcel_coded_zonation; score 1 = 0–25th pct, 7 = 99–100th pct."),
         tags$li(tags$b("Dayton zoning shapefile + density lookup:"), " DaytonZoning/ + data/dayton_zoning_density.csv."),
         tags$li(tags$b("2024 tax rates:"), " Conservation Project Hennepin Rates 2024.csv."),
         tags$li(tags$b("National Wetland Inventory (NWI):"), " hennepin_wetland_merged.shp — used to filter out undevelopable wetland parcels from the suggested-development candidate pool.")
@@ -450,8 +769,9 @@ server <- function(input, output, session) {
     }
   })
 
-  # ---- redraw suggested development layer ------------------------------
-  observe({
+  # ---- redraw suggested development layer (DISABLED Aug 2026) -----------
+  # Suggested Development turned off; if(FALSE) disables the observe reversibly.
+  if (FALSE) observe({
     sug <- scenario()$suggested_pids
     proxy <- leafletProxy("map") |> clearGroup("Suggested Development")
     if (length(sug) > 0) {
@@ -544,7 +864,7 @@ server <- function(input, output, session) {
     s1_n     <- if (length(sel) > 0) s[priority_score == 7, .N] else 0
     s1_total <- ZONATION_7_TOTAL_N
     s1_pct   <- if (s1_total > 0) 100 * min(1, s1_n / s1_total) else 0
-    s1_detail <- sprintf("%d of %d top-priority (zonation=7) parcels in easement",
+    s1_detail <- sprintf("%d of %d top natural-value (score 7) parcels in easement",
                          s1_n, s1_total)
 
     # Score 2: fraction of selections adjacent to ANOTHER selection
@@ -603,13 +923,8 @@ server <- function(input, output, session) {
     ntc_removed  <- max(0, baseline_ntc - ntc_new)
     ea_acres     <- sel_acres
     ea_per_ac    <- if (ea_acres > 0) ntc_removed / ea_acres else NA_real_
-    offset_acres <- if (ntc_removed == 0) rep(0, length(NTC_PER_ACRE)) else
-      ntc_removed / NTC_PER_ACRE
-    names(offset_acres) <- names(NTC_PER_ACRE)
-    # Ratio: "1 acre of type X offsets how many easement acres"
-    offset_ratio <- if (is.na(ea_per_ac) || ea_per_ac == 0)
-      rep(NA_real_, length(NTC_PER_ACRE)) else NTC_PER_ACRE / ea_per_ac
-    names(offset_ratio) <- names(NTC_PER_ACRE)
+    # Per-type offset acres and ratios are computed in output$offset_rows, so
+    # switching the built/zoning toggle doesn't rerun this whole reactive.
 
     # Suggested development: greedy over candidates (sorted by score in prep)
     # until cumulative NTC gain ≥ ntc_removed. Also exclude user-selected.
@@ -635,8 +950,6 @@ server <- function(input, output, session) {
          s1_pct = s1_pct, s1_detail = s1_detail,
          s2_pct = s2_pct, s2_detail = s2_detail,
          s3_pct = s3_pct, s3_detail = s3_detail,
-         offset_acres = offset_acres,
-         offset_ratio = offset_ratio,
          ntc_removed  = ntc_removed,
          ea_acres     = ea_acres,
          ea_per_ac    = ea_per_ac,
@@ -715,39 +1028,43 @@ server <- function(input, output, session) {
     if (is.null(x) || is.na(x)) "—" else dollar(x, accuracy = 1)
   })
 
-  off_labels <- c(
-    "Residential (Low Density)"    = "Residential (1)",
-    "Residential (Medium Density)" = "Residential (2-6)",
-    "Residential (High Density)"   = "Residential (>6)",
-    "Commercial"                   = "Commercial"
-  )
   output$offset_rows <- renderUI({
-    sc <- scenario()
-    tagList(lapply(names(off_labels), function(cat) {
-      ac_val  <- sc$offset_acres[cat]
-      per_ac  <- NTC_PER_ACRE[cat]
-      ratio   <- sc$offset_ratio[cat]
-      fmt_ac  <- if (is.na(ac_val) || is.infinite(ac_val) || ac_val == 0) "—"
+    sc    <- scenario()
+    tbl   <- offset_stats_built
+    no_selection <- sc$ntc_removed == 0
+    list_style   <- "margin:0; padding-left:18px; font-size:11px; color:#555; line-height:1.5;"
+    select_hint  <- tags$li(style = "color:#999;", "Select parcels on the map to see the acres needed to offset.")
+    tagList(lapply(seq_len(nrow(tbl)), function(i) {
+      cat     <- tbl$category[i]
+      per_ac  <- tbl$ntc_per_ac[i]
+      # acres of this type needed to recoup the lost capacity, and
+      # "1 acre of this type offsets how many easement acres"
+      ac_val  <- if (no_selection) NA_real_ else sc$ntc_removed / per_ac
+      ratio   <- if (is.na(sc$ea_per_ac) || sc$ea_per_ac == 0) NA_real_ else per_ac / sc$ea_per_ac
+      fmt_ac  <- if (is.na(ac_val) || is.infinite(ac_val)) "—"
                  else paste0(formatC(ac_val, digits = 1, format = "f"), " ac")
       fmt_pa  <- dollar(per_ac, accuracy = 1)
       fmt_r   <- if (is.na(ratio) || is.infinite(ratio) || ratio == 0) "—"
                  else paste0(formatC(ratio, digits = 1, format = "f"), " ea")
+      # sample details live in a hover tooltip on the row title
+      hover   <- sprintf("%s; %s parcels, %s ac", tbl$basis_note[i],
+                         comma(tbl$parcels[i]), comma(tbl$acres[i], accuracy = 0.1))
+      title   <- div(style = "font-size:12px; color:#333; font-weight:600; margin-bottom:4px;",
+                     span(title = hover, style = "cursor:help; border-bottom:1px dotted #999;", cat),
+                     span(title = hover, style = "cursor:help; color:#999; font-weight:400; margin-left:4px;", "ⓘ"))
 
-      div(style = "padding:8px 0; border-bottom:1px solid #eee;",
-          div(style = "font-size:12px; color:#333; font-weight:600; margin-bottom:4px;",
-              off_labels[cat]),
-          tags$ul(style = "margin:0; padding-left:18px; font-size:11px; color:#555; line-height:1.5;",
-            tags$li(tags$b(fmt_pa, "/ac"),
-                    " — Dayton's average tax capacity per acre (computed from existing parcels in this zoning)"),
-            tags$li(tags$b(fmt_ac),
-                    " — acres needed to generate the tax capacity your easements removed"),
+      {
+        body <- tags$ul(style = list_style,
+          tags$li(tags$b(fmt_pa, "/ac"), " — current average tax capacity per acre"),
+          if (no_selection) select_hint else tagList(
+            tags$li(tags$b(fmt_ac), " — acres needed to generate the tax capacity your easements removed"),
             tags$li(tags$b("1 ac = ", fmt_r),
-                    " — one acre replaces this many acres of your current easement in tax capacity")
-          ))
+                    " — one acre replaces this many acres of your current easement in tax capacity")))
+      }
+      div(style = "padding:8px 0; border-bottom:1px solid #eee;", title, body)
     }))
   })
 
-  output$sug_n    <- renderText(length(scenario()$suggested_pids))
   output$sug_ac   <- renderText({
     x <- scenario()$sug_acres
     if (is.null(x) || x == 0) "—" else paste0(formatC(x, digits = 1, format = "f"), " ac")
