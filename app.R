@@ -341,9 +341,9 @@ ui <- fluidPage(
       # Tax shift summary, compact and first: the headline effect of the selection
       div(style = "background:#F2F2F2; border:1px solid #DDDDDD; border-radius:6px; padding:8px 10px; margin-bottom:12px;",
           div(style = "font-size:11px; font-weight:600; color:#555; text-transform:uppercase; margin-bottom:4px;",
-              "Tax increase on remaining parcels"),
+              "City taxes shifted to remaining parcels"),
           div(style = "display:flex; justify-content:space-between; gap:8px; font-size:10px; color:#666;",
-              div(div("Total shifted"),  div(style = "font-size:14px; font-weight:600; color:#333;", textOutput("total_shift", inline = TRUE))),
+              div(div("Total city taxes"),  div(style = "font-size:14px; font-weight:600; color:#333;", textOutput("total_shift", inline = TRUE))),
               div(div("Avg per parcel"), div(style = "font-size:14px; font-weight:600; color:#333;", textOutput("avg_shift", inline = TRUE))),
               div(div("Avg % increase"), div(style = "font-size:14px; font-weight:600; color:#333;", textOutput("avg_pct_shift", inline = TRUE))))),
       h4("City fiscal dashboard"),
@@ -369,10 +369,10 @@ ui <- fluidPage(
           div(class = "label", "Easement acres"),
           div(class = "value", textOutput("off_ea_acres", inline = TRUE))),
       div(class = "metric",
-          div(class = "label", "Lost tax capacity"),
+          div(class = "label", "Lost tax capacity (tax base, not taxes)"),
           div(class = "value", textOutput("off_lost_ntc", inline = TRUE))),
       div(class = "metric",
-          div(class = "label", "Lost capacity per acre"),
+          div(class = "label", "Lost tax capacity per acre"),
           div(class = "value", textOutput("off_ea_per_ac", inline = TRUE))),
       hr(),
       h4("Densification offset"),
@@ -421,10 +421,6 @@ ui <- fluidPage(
       br(), br(),
       actionButton("show_methodology", "Methodology",
                    width = "100%", icon = icon("info-circle"),
-                   style = "background:#fff; border:1px solid #ccc;"),
-      br(), br(),
-      actionButton("show_zoning_density", "Zoning density",
-                   width = "100%", icon = icon("table"),
                    style = "background:#fff; border:1px solid #ccc;"),
       br(), br(),
       p(style = "font-size:11px; color:#888;",
@@ -482,7 +478,7 @@ server <- function(input, output, session) {
                     "Built type: ", built_type, "<br>",
                     "Tax capacity / acre: ",
                     ifelse(in_sim & !is.na(acres) & acres > 0,
-                           paste0("$", formatC(round(tax_capacity / acres), format = "d", big.mark = ",")),
+                           paste0("$", comma(tax_capacity / acres, accuracy = 1)),
                            "n/a")
                   ), htmltools::HTML)) |>
       addPolygons(data = parks,
@@ -596,9 +592,11 @@ server <- function(input, output, session) {
           "100% = a full exemption, lower values = a partial easement."),
       dfn("Lost Tax Capacity",
           "The total tax capacity removed by the easements you have selected."),
-      dfn("Tax Shift",
-          "Because the levy is fixed, the lost tax capacity is redistributed onto the ",
-          "remaining parcels as a higher tax bill. Shown in total and per remaining parcel."),
+      dfn("City Taxes Shifted",
+          "Dollars of city property tax moved onto the remaining parcels. The city levy is ",
+          "fixed, so when easements shrink the tax base, the city rate rises and every other ",
+          "parcel pays a little more. This is taxes (base × rate), not tax base, and covers ",
+          "the city levy only; county and school rates are held fixed. Shown in total and per remaining parcel."),
       dfn("Densification Offset",
           "How much new development — expressed in acres by type — would generate enough ",
           "tax capacity to replace what the easements removed, at the current average ",
@@ -612,58 +610,6 @@ server <- function(input, output, session) {
       tags$p(style = "font-size:12px; color:#888;",
              "For the underlying formulas and data sources, see the ",
              tags$b("Methodology"), " button."),
-      footer = modalButton("Close")
-    ))
-  })
-
-  observeEvent(input$show_zoning_density, {
-    zrow <- function(zone, dist, lot, dens, label)
-      tags$tr(
-        tags$td(style = "padding:3px 10px 3px 0;", tags$b(zone)),
-        tags$td(style = "padding:3px 10px 3px 0;", dist),
-        tags$td(style = "padding:3px 10px 3px 0; white-space:nowrap;", lot),
-        tags$td(style = "padding:3px 10px 3px 0; white-space:nowrap;", dens),
-        tags$td(style = "padding:3px 0; color:#555;", label))
-    grp <- function(txt) tags$tr(
-      tags$td(colspan = 5, style = "padding:10px 0 2px; font-weight:700; color:#1B4332; border-bottom:1px solid #ddd;", txt))
-    showModal(modalDialog(
-      title = "Zoning density — Dayton City Code",
-      size = "l", easyClose = TRUE,
-      tags$p(style = "font-size:13px; color:#444;",
-        "Maximum dwelling units per acre allowed in each Dayton zoning district. ",
-        "R-3, RM and RH are set as ", tags$i("net"), " density (the code excludes wetlands, ",
-        "water, park dedication, arterial streets and the Greenway Corridor from the acreage). ",
-        "The right-hand column shows the category each district falls under in the tool."),
-      tags$table(style = "font-size:12px; border-collapse:collapse; width:100%;",
-        tags$tr(
-          tags$td(style = "padding:2px 10px 6px 0; font-size:10px; text-transform:uppercase; color:#888;", "Zone"),
-          tags$td(style = "padding:2px 10px 6px 0; font-size:10px; text-transform:uppercase; color:#888;", "District"),
-          tags$td(style = "padding:2px 10px 6px 0; font-size:10px; text-transform:uppercase; color:#888;", "Min lot"),
-          tags$td(style = "padding:2px 10px 6px 0; font-size:10px; text-transform:uppercase; color:#888;", "Density (u/ac)"),
-          tags$td(style = "padding:2px 0 6px; font-size:10px; text-transform:uppercase; color:#888;", "Category in tool")),
-        grp("Lower-density residential"),
-        zrow("R-E", "Residential Estate",      "5 ac",      "0.20",  "Large-lot single-family"),
-        zrow("R-2", "Single-Family Large Lot",  "90,000 SF", "0.48",  "Large-lot single-family"),
-        grp("Medium-density residential"),
-        zrow("R-1",  "Single-Family",            "15,000 SF", "~2.9",  "Single-family"),
-        zrow("R-1A", "SF with Lot Averaging",    "10,000 SF", "~4.4",  "Single-family"),
-        zrow("R-3",  "SF Attached & Detached",   "6,500 SF",  "2–4 net","Single-family"),
-        zrow("R-O",  "Historic Village Res.",    "9,000 SF",  "~4.8",  "Single-family"),
-        grp("Higher-density residential"),
-        zrow("RM",   "Medium Density Res.",      "9,000 SF",  "6–12 net","Townhome / multifamily"),
-        zrow("RH",   "High Density Res.",        "2 ac",      "10+ net", "High-density multifamily (none zoned)"),
-        zrow("R-MH", "Manufactured Home",        "3,600 SF",  "~12",   "Manufactured home park"),
-        grp("Agricultural"),
-        zrow("S-A / A-1", "(Special) Agricultural", "40 ac", "0.025", "Agricultural"),
-        zrow("A-2",  "Special Homestead Ag.",    "2.5 ac",    "0.025", "Agricultural")
-      ),
-      tags$hr(),
-      tags$p(style = "font-size:11px; color:#888;",
-        "Source: Dayton City Code §1001.05 Residential Districts (American Legal, 2026 S-12). ",
-        "RH density is a minimum floor (10 u/ac \"or greater\", no maximum). ",
-        "A former \"A-3 Agricultural (Transitional)\" district is not in the current code. ",
-        "Business, industrial and mixed-use districts have no fixed dwelling-density standard. ",
-        "Full values with per-district sources: data/dayton_zoning_density.csv."),
       footer = modalButton("Close")
     ))
   })
@@ -705,8 +651,8 @@ server <- function(input, output, session) {
       tags$p("\"1 ac = 22 ea\" means 1 acre of that use replaces 22 acres of your easement in tax capacity."),
 
       tags$hr(),
-      tags$h4("Tax Increase on Remaining Parcels"),
-      tags$p("Since the levy is fixed, capacity removed by easements is picked up by non-easement parcels via the rate increase. Dashboard shows the aggregate and average increase across those parcels. Note: this section reflects easements only; it does not assume the suggested development has been built."),
+      tags$h4("City Taxes Shifted to Remaining Parcels"),
+      tags$p("Since the city levy is fixed, the city taxes that the removed capacity used to pay are picked up by non-easement parcels via the rate increase: shift = remaining tax base × (new rate − old rate), which is roughly lost tax capacity × city rate. These are city tax dollars, not tax base; county and school rates are held fixed. Dashboard shows the aggregate and average increase across those parcels. Note: this section reflects easements only; it does not assume the suggested development has been built."),
 
       tags$hr(),
       tags$h4("Suggested Development (Black Layer)"),
